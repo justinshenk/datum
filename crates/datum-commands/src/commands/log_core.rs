@@ -598,7 +598,7 @@ pub(crate) fn log_entry(action: Action, mut args: LogArgs, db: &Db) -> Result<()
     // fact: `extra_metadata` is out of the content hash, so the same line
     // logged by two actors is still one entry. The op's origin carries it too
     // (`datum history`).
-    if let Some(actor) = actor() {
+    if let Some(actor) = datum_core::entry::actor_from_env() {
         entry.extra_metadata.get_or_insert_with(|| json!({}))["actor"] = json!(actor);
     }
 
@@ -1092,14 +1092,6 @@ pub(crate) fn log_entry(action: Action, mut args: LogArgs, db: &Db) -> Result<()
     }
 
     Ok(())
-}
-
-/// The actor `DATUM_ACTOR` names, trimmed; none when unset or blank.
-pub(crate) fn actor() -> Option<String> {
-    std::env::var("DATUM_ACTOR")
-        .ok()
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
 }
 
 /// Parsed LogArgs: the field, the state and the rest of the data payload.

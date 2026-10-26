@@ -168,7 +168,7 @@ fn origin() -> Value {
         ("program", Some(program.into())),
         ("version", Some(crate::build().into())),
         ("script", env("DATUM_SCRIPT")),
-        ("actor", env("DATUM_ACTOR")),
+        ("actor", crate::entry::actor_from_env()),
     ];
     let o: Map<String, Value> = parts
         .into_iter()

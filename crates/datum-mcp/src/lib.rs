@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -37,6 +38,32 @@ pub const READ_COMMANDS: &[&str] = &[
 /// Flags `datum_read` refuses whatever the command: each makes a read write.
 const WRITING_FLAGS: &[&str] = &["--fix"];
 
+/// A word that makes `tail` or `head` watch for new rows forever: `-w`,
+/// `--watch[=…]`, or a bundle of short flags with `w` in it (`-Aw`).
+fn never_ends(word: &str) -> bool {
+    word == "--watch"
+        || word.starts_with("--watch=")
+        || word
+            .strip_prefix('-')
+            .filter(|rest| !rest.starts_with('-'))
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('w'))
+}
+
+/// Keys a log line lifts out of its data onto the entry's own columns
+/// (`extract_reserved_columns` in datum-commands' `log_core.rs`): as `data`
+/// they would move the entry to another field or state than the call names.
+const RESERVED_KEYS: &[&str] = &[
+    "field",
+    "state",
+    "following_state",
+    "occur_time",
+    "dur",
+    "start_time",
+    "end_time",
+    "dur_uncertainty",
+    "occur_time_uncertainty",
+];
+
 /// The verbs `datum_log` takes.
 pub const LOG_COMMANDS: &[&str] = &["occur", "start", "stop", "switch", "note"];
 
@@ -53,7 +80,17 @@ pub struct Config {
     pub db: Option<String>,
     /// Who the writes are on behalf of, as `DATUM_ACTOR`.
     pub actor: String,
+    /// How long one `datum` run may take before it is killed and the call
+    /// answers with an error, so no command can stall the session.
+    pub timeout: Duration,
 }
+
+/// A run's default time limit.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most of a run's output a tool result carries: past it the text is
+/// cut, and says so, so one large read cannot fill a model's context.
+pub const MAX_OUTPUT: usize = 64 * 1024;
 
 /// What one `datum` run gave back.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,17 +124,59 @@ impl Runner for ProcessRunner {
         if let Some(db) = &config.db {
             cmd.env("DATUM_DB", db);
         }
-        match cmd.output() {
-            Ok(out) => RunOutput {
-                code: out.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            },
-            Err(e) => RunOutput {
-                code: -1,
-                stdout: String::new(),
-                stderr: format!("could not run {}: {e}", config.bin.display()),
-            },
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return RunOutput {
+                    code: -1,
+                    stdout: String::new(),
+                    stderr: format!("could not run {}: {e}", config.bin.display()),
+                }
+            }
+        };
+        // Both pipes are drained as the process writes, so neither can fill
+        // and stall it while the deadline is watched.
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+        };
+        let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
+        let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
+        let deadline = Instant::now() + config.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        let stdout = out.join().unwrap_or_default();
+        let mut stderr = err.join().unwrap_or_default();
+        let code = match status {
+            Some(status) => status.code().unwrap_or(-1),
+            None => {
+                stderr.push_str(&format!(
+                    "\nstopped after {}s: the command did not finish",
+                    config.timeout.as_secs()
+                ));
+                -1
+            }
+        };
+        RunOutput {
+            code,
+            stdout,
+            stderr,
         }
     }
 }
@@ -142,11 +221,13 @@ impl<R: Runner> Server<R> {
             }
         };
         match msg {
-            Value::Array(batch) => {
-                let replies: Vec<Value> =
-                    batch.into_iter().filter_map(|m| self.handle(m)).collect();
-                (!replies.is_empty()).then_some(Value::Array(replies))
-            }
+            // MCP (2025-06-18) has no JSON-RPC batches: an array is refused
+            // whole, as one invalid request.
+            Value::Array(_) => Some(error_reply(
+                Value::Null,
+                -32600,
+                "invalid request: batches are not supported",
+            )),
             m => self.handle(m),
         }
     }
@@ -155,6 +236,11 @@ impl<R: Runner> Server<R> {
     /// neither does a response the client sends.
     pub fn handle(&self, msg: Value) -> Option<Value> {
         let id = msg.get("id").cloned();
+        // A response from the client (to a request this server never makes)
+        // is never answered.
+        if msg.get("result").is_some() || msg.get("error").is_some() {
+            return None;
+        }
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             return id.map(|id| error_reply(id, -32600, "invalid request: no method"));
         };
@@ -211,7 +297,10 @@ impl<R: Runner> Server<R> {
         let out = self.runner.run(&self.config, &argv);
         Ok(match out.code {
             0 => tool_result(&join_output(&out), false),
-            EXIT_DUPLICATE => tool_result(
+            // Exit 11 is both a content-identical re-log, a success that
+            // writes nothing, and a slug collision with different data, an
+            // error the CLI prints as one. Only the first is "already logged".
+            EXIT_DUPLICATE if !out.stderr.contains("Error:") => tool_result(
                 &format!("already logged (one entry, not two)\n{}", join_output(&out)),
                 false,
             ),
@@ -239,6 +328,23 @@ fn join_output(out: &RunOutput) -> String {
     if text.is_empty() {
         text.push_str("(no output)");
     }
+    truncate(text)
+}
+
+/// `text` cut to [`MAX_OUTPUT`] bytes on a character boundary, saying so.
+fn truncate(mut text: String) -> String {
+    if text.len() <= MAX_OUTPUT {
+        return text;
+    }
+    let total = text.len();
+    let mut cut = MAX_OUTPUT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str(&format!(
+        "\n… output cut at {MAX_OUTPUT} of {total} bytes: ask for fewer rows (`-n`) or one field"
+    ));
     text
 }
 
@@ -289,6 +395,10 @@ pub fn tools() -> Value {
                         "description": "Details as key/value pairs, e.g. {\"task\": \"auth\", \"files\": 3}.",
                         "additionalProperties": { "type": ["string", "number", "boolean"] }
                     },
+                    "text": {
+                        "type": "string",
+                        "description": "For `note`: the note's text, kept as `comment`."
+                    },
                     "time": {
                         "type": "string",
                         "description": "When, if not now: datum's -t, e.g. `-5` (5 min ago), `14:30`, an ISO time."
@@ -300,7 +410,7 @@ pub fn tools() -> Value {
                 },
                 "required": ["command", "field"]
             },
-            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
         },
         {
             "name": "datum_now",
@@ -365,9 +475,10 @@ fn positional(s: &str, what: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err(format!("{what} may not be empty"));
     }
-    if s.starts_with('-') && s.parse::<f64>().is_err() {
-        return Err(format!("{what} may not start with `-`: {s:?}"));
-    }
+    // It goes after a bare `--`, which reads every word after it as typed:
+    // no flag, `key=value`, trailing verb or duration (da-gqy3b). `=` is
+    // still refused, so a state never looks like data to a person reading
+    // the line back.
     if s.contains('=') {
         return Err(format!("{what} may not contain `=`: {s:?}"));
     }
@@ -394,11 +505,17 @@ pub fn log_argv(args: &Value) -> Result<Vec<String>, String> {
         return Err(format!("not a field name: {field:?}"));
     }
     let mut argv = vec![command.to_string(), field.to_string()];
-    match (command, args.get("state").filter(|v| !v.is_null())) {
-        ("switch", Some(state)) => argv.push(positional(&scalar(state)?, "`state`")?),
+    let state = match (command, args.get("state").filter(|v| !v.is_null())) {
+        ("switch", Some(state)) => Some(positional(&scalar(state)?, "`state`")?),
         ("switch", None) => return Err("`switch` needs a `state`".into()),
         (_, Some(_)) => return Err(format!("`state` is for `switch`, not `{command}`")),
-        (_, None) => {}
+        (_, None) => None,
+    };
+    if let Some(text) = str_arg(args, "text")? {
+        if command != "note" {
+            return Err(format!("`text` is for `note`, not `{command}`"));
+        }
+        argv.push(format!("comment={text}"));
     }
     if let Some(data) = args.get("data").filter(|v| !v.is_null()) {
         let data = data.as_object().ok_or("`data` must be an object")?;
@@ -408,23 +525,27 @@ pub fn log_argv(args: &Value) -> Result<Vec<String>, String> {
             if !valid_name(key) {
                 return Err(format!("not a key name: {key:?}"));
             }
-            if matches!(
-                key.as_str(),
-                "occur_time" | "dur" | "start_time" | "end_time"
-            ) {
+            if RESERVED_KEYS.contains(&key.as_str()) {
                 return Err(format!(
-                    "`{key}` is set by `time` and `duration`, not `data`"
+                    "`{key}` is not data: datum reads it as a column (set `field`, `state`, `time` or `duration` instead)"
                 ));
             }
             argv.push(format!("{key}={}", scalar(value)?));
         }
     }
     if let Some(dur) = str_arg(args, "duration")? {
+        if command == "note" {
+            return Err("a `note` is timeless and takes no `duration`".into());
+        }
         argv.push(format!("dur={dur}"));
     }
     if let Some(time) = str_arg(args, "time")? {
         argv.push("-t".into());
         argv.push(time);
+    }
+    if let Some(state) = state {
+        argv.push("--".into());
+        argv.push(state);
     }
     Ok(argv)
 }
@@ -480,7 +601,16 @@ pub fn read_argv(args: &Value) -> Result<Vec<String>, String> {
             READ_COMMANDS.join(", ")
         ));
     }
-    if let Some(flag) = argv.iter().find(|w| WRITING_FLAGS.contains(&w.as_str())) {
+    if let Some(flag) = argv.iter().find(|w| never_ends(w)) {
+        return Err(format!(
+            "`{flag}` watches and never returns; read once instead"
+        ));
+    }
+    if let Some(flag) = argv.iter().find(|w| {
+        WRITING_FLAGS
+            .iter()
+            .any(|f| *w == f || w.starts_with(&format!("{f}=")))
+    }) {
         return Err(format!("`{flag}` writes, and `datum_read` only reads"));
     }
     if argv.iter().any(|w| w == "--db" || w.starts_with("--db=")) {
@@ -496,6 +626,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut actor = std::env::var("DATUM_ACTOR")
         .ok()
         .filter(|a| !a.trim().is_empty());
+    let mut timeout = DEFAULT_TIMEOUT;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |name: &str| {
@@ -507,6 +638,15 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             "--bin" => bin = Some(PathBuf::from(value("--bin")?)),
             "--db" => db = Some(value("--db")?),
             "--actor" => actor = Some(value("--actor")?),
+            "--timeout" => {
+                let secs = value("--timeout")?;
+                timeout = secs
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|s| *s > 0)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| format!("--timeout takes whole seconds, not {secs:?}"))?;
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
         }
@@ -517,6 +657,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         actor: actor
             .map(|a| a.trim().to_string())
             .unwrap_or_else(|| "agent".into()),
+        timeout,
     })
 }
 
@@ -543,6 +684,7 @@ USAGE:
   --actor NAME   who the writes are on behalf of (else DATUM_ACTOR, else `agent`);
                  entries carry it as extra_metadata.actor
   --bin PATH     the datum binary (else DATUM_BIN, else `datum` beside this one or on PATH)
+  --timeout SECS how long one datum run may take before it is stopped (default 30)
 
 Claude Code:
   claude mcp add datum -- datum-mcp --actor agent:claude-code
@@ -576,6 +718,7 @@ mod tests {
                 bin: "datum".into(),
                 db: None,
                 actor: "agent:test".into(),
+                timeout: DEFAULT_TIMEOUT,
             },
             Fake {
                 calls: RefCell::default(),
@@ -661,7 +804,11 @@ mod tests {
                 &json!({"command":"switch","field":"environment","state":"staging","time":"-5"})
             )
             .unwrap(),
-            argv(&["switch", "environment", "staging", "-t", "-5"])
+            argv(&["switch", "environment", "-t", "-5", "--", "staging"])
+        );
+        assert_eq!(
+            log_argv(&json!({"command":"note","field":"idea","text":"try a cache"})).unwrap(),
+            argv(&["note", "idea", "comment=try a cache"])
         );
         assert_eq!(
             log_argv(&json!({"command":"stop","field":"refactor","duration":"30m"})).unwrap(),
@@ -681,8 +828,12 @@ mod tests {
             json!({"command":"occur","field":"--db"}),
             json!({"command":"occur","field":"a b"}),
             json!({"command":"switch","field":"mood"}),
-            json!({"command":"switch","field":"mood","state":"--fix"}),
             json!({"command":"switch","field":"mood","state":"a=b"}),
+            json!({"command":"occur","field":"x","text":"t"}),
+            json!({"command":"note","field":"x","duration":"5m"}),
+            json!({"command":"occur","field":"x","data":{"field":"other"}}),
+            json!({"command":"occur","field":"x","data":{"state":"y"}}),
+            json!({"command":"stop","field":"x","data":{"following_state":"y"}}),
             json!({"command":"occur","field":"x","state":"y"}),
             json!({"command":"occur","field":"x","data":{"-t":"1"}}),
             json!({"command":"occur","field":"x","data":{"occur_time":"1"}}),
@@ -699,6 +850,50 @@ mod tests {
         let r = call(&s, "datum_log", json!({"command":"occur","field":"--db"}));
         assert_eq!(r["isError"], true);
         assert!(s.runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_state_that_looks_like_a_flag_is_a_state() {
+        // After `--`, the CLI reads it as typed, so it can be neither a flag
+        // (`-Infinity` would read as `-I`) nor a trailing verb.
+        for state in ["--fix", "-Infinity", "end", "-3"] {
+            let a = log_argv(&json!({"command":"switch","field":"mood","state":state})).unwrap();
+            assert_eq!(a[a.len() - 2..], argv(&["--", state]), "{state}");
+        }
+    }
+
+    #[test]
+    fn read_refuses_a_watch_that_never_returns() {
+        for w in ["-w", "--watch", "--watch=2", "-Aw"] {
+            assert!(read_argv(&json!({"args":["tail", w]})).is_err(), "{w}");
+        }
+        assert!(read_argv(&json!({"args":["tail","-n","5"]})).is_ok());
+        assert!(read_argv(&json!({"args":["get","x","--fix=all"]})).is_err());
+    }
+
+    #[test]
+    fn a_batch_is_refused_and_a_response_unanswered() {
+        let s = server(None);
+        let r = s
+            .handle_line(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#)
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32600);
+        assert!(s.handle_line("[]").is_some());
+        assert!(s
+            .handle(json!({"jsonrpc":"2.0","id":9,"result":{}}))
+            .is_none());
+        assert!(s
+            .handle(json!({"jsonrpc":"2.0","id":9,"error":{"code":1,"message":"x"}}))
+            .is_none());
+    }
+
+    #[test]
+    fn long_output_is_cut_and_says_so() {
+        let big = "é".repeat(MAX_OUTPUT);
+        let out = truncate(big);
+        assert!(out.len() < MAX_OUTPUT + 200);
+        assert!(out.contains("output cut at"));
+        assert_eq!(truncate("short".into()), "short");
     }
 
     #[test]
@@ -736,6 +931,14 @@ mod tests {
         }));
         let r = call(&dup, "datum_log", json!({"command":"occur","field":"x"}));
         assert_eq!(r["isError"], false);
+        // Exit 11 with an error is a slug collision: nothing was written.
+        let clash = server(Some(RunOutput {
+            code: 11,
+            stdout: String::new(),
+            stderr: "Error: duplicate slug x:… with different data".into(),
+        }));
+        let r = call(&clash, "datum_log", json!({"command":"occur","field":"x"}));
+        assert_eq!(r["isError"], true);
         let bad = server(Some(RunOutput {
             code: 1,
             stdout: String::new(),

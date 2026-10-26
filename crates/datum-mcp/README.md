@@ -84,8 +84,28 @@ rows with `actor = agent:claude-code` on time.
 | `datum_tail` | `datum tail [FIELD] -n N --json`; each row names its `actor` |
 | `datum_read` | one read-only command and its words: `tail`, `head`, `now`, `get`, `grep`, `stats`, `fields`, `history`, `why`, `count`, `ids` |
 
-A field, key or state that would read as a flag or as another key is refused
-before anything runs, and `datum_read` refuses `--fix` and `--db`.
+A field or key that would read as a flag, or a data key datum reads as a
+column (`field`, `state`, `occur_time`, …), is refused before anything runs. A
+`switch` state goes after a bare `--`, so it is always read as typed. A
+`note` takes its words as `text`, kept as `comment`. `datum_read` refuses
+`--fix`, `--db` and the watch flags (`-w`, `--watch`), which never return.
+
+Each `datum` run is stopped after `--timeout` seconds (30 by default), and a
+result longer than 64 KB is cut, saying so.
+
+## Known limits
+
+- **The actor is the creator's.** An entry keeps the actor that logged it.
+  A later `update`, `retime` or `edit`, or a re-log that matches it, leaves
+  `extra_metadata.actor` as it was; who made each later change is in that
+  change's origin, which `datum history` lists.
+- **Two copies, two actors, one instant.** When two synced copies log the
+  same field at the same instant, sync merges them into one entry
+  (da-vkeg0). If the two were logged by different actors, the merged entry
+  shows a conflict on `extra_metadata` to resolve, since the fold compares
+  that object whole. Treating the actor as provenance there (beside
+  `create_time`) would be a change to the fold rule, and is left for the
+  maintainer to decide.
 
 ## Use
 

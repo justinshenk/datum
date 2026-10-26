@@ -554,6 +554,17 @@ pub fn build_slug(field: &str, time: Option<&DatumTime>, create_time: &DateTime<
     Slug(entry_id::build_slug(field, time, precision, create_time))
 }
 
+/// The actor `DATUM_ACTOR` names — who a change is on behalf of (`human`,
+/// `agent:claude-code`) — trimmed, and none when unset or blank. The one
+/// reading of it, so a logged entry's `extra_metadata.actor` and its op's
+/// origin always say the same.
+pub fn actor_from_env() -> Option<String> {
+    std::env::var("DATUM_ACTOR")
+        .ok()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
