@@ -146,9 +146,12 @@ fn client_id() -> String {
 /// Who and what signs the ops from here (da-zjc9w), carried in each as
 /// `origin`: the OS `user` and `host`, the `installation` (this client's id),
 /// the `program` — `datum`, or `datum.day` for the browser's CLI — its
-/// `version`, and the `script` `DATUM_SCRIPT` names. A part this process
-/// cannot know, as a browser cannot its user or host, is left out rather
-/// than invented. Read once, at the first op.
+/// `version`, the `script` `DATUM_SCRIPT` names, and the `actor`
+/// `DATUM_ACTOR` names: the person or agent the change is on behalf of
+/// (`human`, `agent:claude-code`), which the entry carries too as
+/// `extra_metadata.actor`. A part this process cannot know, as a browser
+/// cannot its user or host, is left out rather than invented. Read once, at
+/// the first op.
 fn origin() -> Value {
     if let Some(o) = INVOCATION.with(|i| i.borrow().origin.clone()) {
         return o;
@@ -165,6 +168,7 @@ fn origin() -> Value {
         ("program", Some(program.into())),
         ("version", Some(crate::build().into())),
         ("script", env("DATUM_SCRIPT")),
+        ("actor", env("DATUM_ACTOR")),
     ];
     let o: Map<String, Value> = parts
         .into_iter()

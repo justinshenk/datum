@@ -1874,6 +1874,11 @@ pub const ENV_VARS: &[EnvVarSpec] = &[
         summary: "Name a scripted run: every change it makes says so in its origin (`datum history`).",
     },
     EnvVarSpec {
+        name: "DATUM_ACTOR",
+        key: "",
+        summary: "Who a change is on behalf of (`human`, `agent:claude-code`): logged entries carry it as `extra_metadata.actor`, every op in its origin.",
+    },
+    EnvVarSpec {
         name: "DATUM_EDITOR",
         key: "editor",
         summary: "Editor for `datum edit`. Read FIRST, before toml `editor`, `$VISUAL`, `$EDITOR`.",

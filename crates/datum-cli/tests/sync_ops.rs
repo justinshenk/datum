@@ -33,6 +33,7 @@ impl Copy {
     fn run_env(&self, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_datum"))
             .env_remove("DATUM_SCRIPT")
+            .env_remove("DATUM_ACTOR")
             .envs(env.iter().copied())
             .env("DATUM_DB", self.db())
             .env("DATUM_HOME", self.tmp.path().join("home"))
@@ -256,6 +257,44 @@ fn a_second_copy_reads_each_op_s_origin() {
     }
     let history = b.ok(&["history", &b.hid("tea")]);
     assert!(history.contains(" · script nightly"), "{history}");
+}
+
+/// `DATUM_ACTOR` names who a change is on behalf of: a logged entry carries
+/// it as `extra_metadata.actor`, its op's origin as `actor`, and a second
+/// copy reads both back. Unset, neither says anything.
+#[test]
+fn an_actor_is_on_the_entry_and_in_its_op_s_origin() {
+    let (a, b) = (Copy::new(), Copy::new());
+    a.ok(&["occur", "coffee"]);
+    let agent = a.run_env(
+        &["start", "refactor", "task=auth"],
+        "",
+        &[("DATUM_ACTOR", "agent:claude-code")],
+    );
+    assert!(
+        agent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agent.stderr)
+    );
+    a.send(&b);
+    let meta = |field: &str| -> Value {
+        let raw = b.query(
+            "SELECT coalesce(extra_metadata, 'null') FROM entries WHERE hid = ?1",
+            &b.hid(field),
+        );
+        serde_json::from_str(&raw).unwrap()
+    };
+    assert_eq!(meta("refactor")["actor"], "agent:claude-code");
+    assert!(meta("coffee").get("actor").is_none(), "{}", meta("coffee"));
+    let origin = |field: &str| {
+        let versions: Value =
+            serde_json::from_str(&b.ok(&["history", &b.hid(field), "--show", "json"])).unwrap();
+        versions[0]["origin"].clone()
+    };
+    assert_eq!(origin("refactor")["actor"], "agent:claude-code");
+    assert!(origin("coffee").get("actor").is_none());
+    let history = b.ok(&["history", &b.hid("refactor")]);
+    assert!(history.contains(" · actor agent:claude-code"), "{history}");
 }
 
 #[test]

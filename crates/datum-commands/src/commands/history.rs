@@ -132,6 +132,7 @@ fn origin(o: Option<&JsonValue>) -> String {
         Some(program.collect::<Vec<_>>().join(" ")).filter(|p| !p.is_empty()),
         part("installation").map(|i| format!("installation {i}")),
         part("script").map(|s| format!("script {s}")),
+        part("actor").map(|a| format!("actor {a}")),
     ];
     parts.into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }

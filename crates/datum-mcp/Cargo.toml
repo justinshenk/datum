@@ -1,0 +1,17 @@
+[package]
+name = "datum-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A Model Context Protocol server over the datum CLI, so agents can log to and read a datum database"
+
+[lib]
+name = "datum_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "datum-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true

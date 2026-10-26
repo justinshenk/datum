@@ -20,6 +20,7 @@ crates/
   datum-sync/         # Easy Sync natively: the wire crate over `Db`, `sync run`, the QR
   datum-sync-wire/    # Easy Sync's session protocol and iroh endpoint over a `Store` trait; also wasm32-unknown-unknown (datum.day's sync worker)
   datum-test-util/    # Shared harness for tests that mutate process-global state (env vars, TZ)
+  datum-mcp/          # `datum-mcp`: an MCP server (stdio) over the `datum` binary, so agents log and read; writes carry its actor
 web/            # SvelteKit PWA: static, the real CLI as WASI on OPFS, offline-capable
                 # its conventions — the seam, the beat, the panes, the tests: docs/web-conventions.md
 ```
@@ -275,8 +276,9 @@ The relay sync is deleted; p2p «Easy Sync» replaced it. Its core is in
 `crates/datum-core/src/db/sync.rs`: every entry change emits a signed op beside
 its `history::record` (endpoint key in `sync_local`, HLC, the change's own `raw`
 line, its key-level `effect`, its `origin`: user, host, installation, program,
-version and the `DATUM_SCRIPT` name, each where known, which `datum history`
-shows, da-zjc9w), and an entry's row is the FOLD of its ops in HLC order, so the
+version, the `DATUM_SCRIPT` name and the `DATUM_ACTOR` actor, each where
+known, which `datum history` shows, da-zjc9w; a logged entry carries the actor
+too, as `extra_metadata.actor`), and an entry's row is the FOLD of its ops in HLC order, so the
 same ops in any order give the same row.
 
 ### Conflicts and restored rows
