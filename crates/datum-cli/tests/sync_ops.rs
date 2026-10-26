@@ -295,6 +295,19 @@ fn an_actor_is_on_the_entry_and_in_its_op_s_origin() {
     assert!(origin("coffee").get("actor").is_none());
     let history = b.ok(&["history", &b.hid("refactor")]);
     assert!(history.contains(" · actor agent:claude-code"), "{history}");
+    // `tail --json` names it on the row, and says nothing on a row without.
+    let tail: Value = serde_json::from_str(&b.ok(&["tail", "--json"])).unwrap();
+    let row = |field: &str| {
+        tail["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["field"] == field)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(row("refactor")["actor"], "agent:claude-code");
+    assert!(row("coffee").get("actor").is_none());
 }
 
 #[test]

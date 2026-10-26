@@ -312,7 +312,7 @@ pub fn tools() -> Value {
         {
             "name": "datum_tail",
             "title": "Recent datum entries",
-            "description": "The most recent entries, as JSON, optionally of one field.",
+            "description": "The most recent entries, as JSON, optionally of one field. Each row names the `actor` that logged it, where one did.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

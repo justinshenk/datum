@@ -165,6 +165,12 @@ pub struct TailRow {
     pub data: JsonValue,
     pub create_time: String,
     pub modify_time: String,
+    /// Who the row was logged on behalf of (`DATUM_ACTOR`, kept as
+    /// `extra_metadata.actor`): `human`, `agent:claude-code`. Absent, not
+    /// `null`, on a row with none, so a listing of rows no actor wrote is
+    /// what it was before the key existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// Build the JSON rows for a rendered tail listing. `contexts` are the same
@@ -237,6 +243,12 @@ pub fn tail_rows(
                 data: e.data.clone().unwrap_or(JsonValue::Null),
                 create_time: e.create_time.to_rfc3339(),
                 modify_time: e.modify_time.to_rfc3339(),
+                actor: e
+                    .extra_metadata
+                    .as_ref()
+                    .and_then(|m| m.get("actor"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string),
             }
         })
         .collect()

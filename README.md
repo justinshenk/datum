@@ -127,6 +127,10 @@ datum, it looks them up.
 It can keep its own record the same way: what it worked on and when, what it decided, how it was doing. Agents that
 use the CLI read [`skills/datum/SKILL.md`](skills/datum/SKILL.md), and [docs/agents.md](docs/agents.md) has the rest.
 
+An agent that speaks MCP can use [`datum-mcp`](crates/datum-mcp/README.md) instead of a shell: datum's verbs as
+tools, with every entry it writes marked with its actor (`DATUM_ACTOR`), so a record shared by a person and their
+agents says which of them wrote each row. That record can then be checked against what the agent actually did.
+
 ## Learn more
 
 [docs/](docs/README.md) has the rest: the [concepts](docs/concepts.md), every [command](docs/commands.md),
